@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f6f4ef" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16161a" media="(prefers-color-scheme: dark)">
+<title>Simple Web Apps</title>
+<style>
+:root{
+  --bg:#f6f4ef; --card:#fff; --text:#1d1d22; --muted:#6a6a75; --line:#e2dfd7; --accent:#c2410c;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#16161a; --card:#212127; --text:#ececf1; --muted:#9a9aa6; --line:#33333b; --accent:#fb923c; }
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{min-height:100dvh;background:var(--bg);color:var(--text);
+  font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  padding:max(24px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right))
+          max(24px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
+main{max-width:640px;margin:0 auto}
+h1{font-size:1.6rem;margin-bottom:.25rem}
+.lead{color:var(--muted);margin-bottom:1.5rem}
+h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:1.5rem 0 .5rem}
+ul{list-style:none;display:grid;gap:.5rem}
+a.app{display:block;padding:.9rem 1rem;background:var(--card);border:1px solid var(--line);
+  border-radius:12px;color:inherit;text-decoration:none}
+a.app:hover,a.app:focus-visible{border-color:var(--accent);outline:none}
+a.app b{display:block}
+a.app span{color:var(--muted);font-size:.9rem}
+.empty{color:var(--muted);font-style:italic}
+</style>
+</head>
+<body>
+<main>
+  <h1>Simple Web Apps</h1>
+  <p class="lead">Small single-file games and tools for PC and phone browsers.</p>
+
+  <h2>Games</h2>
+  <ul>
+    <li><a class="app" href="quick-draw-duel.html"><b>Quick Draw Duel</b><span>Western reaction duel, 2 players on one screen or vs computer.</span></a></li>
+  </ul>
+
+  <h2>Utilities</h2>
+  <ul>
+    <li class="empty">None yet.</li>
+  </ul>
+</main>
+</body>
+</html>

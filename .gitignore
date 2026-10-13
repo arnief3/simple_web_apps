@@ -1,0 +1,15 @@
+# Python / test tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+test-results/
+
+# Local secrets / machine settings
+.env
+
+# Editors / OS
+.idea/
+*.swp
+.DS_Store
