@@ -1,10 +1,10 @@
-"""Basic interaction checks for quick-draw-duel.html."""
+"""Basic interaction checks for quick-draw-duel."""
 
 from playwright.sync_api import Page, expect
 
 
 def _open(page: Page, base_url: str) -> None:
-    page.goto(f"{base_url}/quick-draw-duel.html")
+    page.goto(f"{base_url}/quick-draw-duel/")
     expect(page.locator("#menu")).to_be_visible()
 
 

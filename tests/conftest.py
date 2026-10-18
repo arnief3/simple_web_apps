@@ -11,8 +11,8 @@ from playwright.sync_api import Browser, Page, sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Every top-level *.html file is an app (index.html is the launcher page).
-APPS = sorted(p.name for p in ROOT.glob("*.html") if p.name != "index.html")
+# Every top-level folder with an index.html is an app (the root index.html is the launcher).
+APPS = sorted(p.parent.name for p in ROOT.glob("*/index.html") if not p.parent.name.startswith("."))
 
 VIEWPORTS = {
     "desktop": {"viewport": {"width": 1280, "height": 800}},

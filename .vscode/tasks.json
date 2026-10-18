@@ -9,6 +9,12 @@
       "problemMatcher": []
     },
     {
+      "label": "Make PNG icons",
+      "type": "shell",
+      "command": "uv run python scripts/make_icons.py",
+      "problemMatcher": []
+    },
+    {
       "label": "Run tests",
       "type": "shell",
       "command": "uv run pytest",

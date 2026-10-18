@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f766e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Miles Per Day</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --bg: #f5f7f7; --card: #ffffff; --text: #14201f; --muted: #5b6b69;
+    --accent: #0f766e; --accent-ink: #ffffff; --line: #d9e1e0; --bad: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0d1413; --card: #16201f; --text: #e8efee; --muted: #93a6a3;
+      --accent: #2dd4bf; --accent-ink: #062b27; --line: #2a3735; --bad: #f97066; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top) 16px calc(24px + env(safe-area-inset-bottom)); }
+  header { padding: 18px 0 10px; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: .9rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px; margin-top: 12px; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin: 10px 0 4px; }
+  label:first-child { margin-top: 0; }
+  input[type=text], input[type=date], input[type=number] {
+    width: 100%; padding: 12px; font-size: 16px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  button { font: inherit; border: 0; border-radius: 10px; padding: 12px 14px; cursor: pointer; }
+  .primary { width: 100%; margin-top: 14px; background: var(--accent); color: var(--accent-ink);
+    font-weight: 600; font-size: 1.05rem; }
+  .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); flex: 0 0 auto; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: .95rem; min-height: 44px; }
+  .check input { width: 20px; height: 20px; }
+  .units { display: flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: 12px; }
+  .units button { flex: 1; border-radius: 0; background: transparent; color: var(--text); padding: 10px; }
+  .units button.on { background: var(--accent); color: var(--accent-ink); }
+  .big { font-size: 2.4rem; font-weight: 700; line-height: 1.1; }
+  .big small { font-size: 1rem; font-weight: 500; color: var(--muted); }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+  .stat { background: var(--bg); border-radius: 10px; padding: 10px; }
+  .stat b { display: block; font-size: 1.15rem; }
+  .stat span { font-size: .8rem; color: var(--muted); }
+  #map { height: 280px; border-radius: 12px; margin-top: 12px; }
+  .msg { margin-top: 10px; font-size: .9rem; color: var(--muted); }
+  .msg.err { color: var(--bad); }
+  #routeNote { white-space: pre-line; overflow-wrap: anywhere; }
+  .hidden { display: none; }
+  footer { margin-top: 18px; font-size: .75rem; color: var(--muted); text-align: center; }
+  footer a { color: inherit; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Miles Per Day</h1>
+  <p>Fastest driving route, split into daily distances.</p>
+</header>
+
+<form id="form" class="card" autocomplete="off">
+  <label for="start">Start</label>
+  <div class="row">
+    <input id="start" type="text" placeholder="Address, town, or use GPS">
+    <button type="button" class="ghost" id="gps" aria-label="Use my location">📍</button>
+  </div>
+
+  <label for="dest">Destination</label>
+  <input id="dest" type="text" placeholder="e.g. Darwin NT" required>
+
+  <label for="date">Arrive by</label>
+  <input id="date" type="date" required>
+
+  <label class="check"><input type="checkbox" id="today" checked> Start driving today</label>
+
+  <label for="rest">Rest days (no driving)</label>
+  <input id="rest" type="number" min="0" step="1" value="0" inputmode="numeric">
+
+  <div class="units" role="group" aria-label="Units">
+    <button type="button" data-u="mi" class="on">Miles</button>
+    <button type="button" data-u="km">Kilometres</button>
+  </div>
+
+  <button class="primary" type="submit" id="go">Calculate</button>
+  <div id="msg" class="msg" aria-live="polite"></div>
+</form>
+
+<section id="result" class="card hidden">
+  <div class="big"><span id="perDay">–</span> <small id="perDayUnit">mi / day</small></div>
+  <div class="stats">
+    <div class="stat"><b id="total">–</b><span>Total distance</span></div>
+    <div class="stat"><b id="time">–</b><span>Total drive time</span></div>
+    <div class="stat"><b id="days">–</b><span>Driving days</span></div>
+    <div class="stat"><b id="hrsDay">–</b><span>Driving hours / day</span></div>
+  </div>
+  <div id="routeNote" class="msg"></div>
+  <div id="map"></div>
+</section>
+
+<footer>
+  Routing: <a href="https://project-osrm.org" target="_blank" rel="noopener">OSRM</a>,
+  <a href="https://valhalla.github.io/valhalla/" target="_blank" rel="noopener">Valhalla</a>
+  (<a href="https://fossgis.de" target="_blank" rel="noopener">FOSSGIS</a>) ·
+  Search: <a href="https://nominatim.org" target="_blank" rel="noopener">Nominatim</a>,
+  <a href="https://photon.komoot.io" target="_blank" rel="noopener">Photon</a>,
+  <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a> ·
+  Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const KM_PER_MI = 1.609344;
+let units = 'mi';
+let gpsCoords = null;   // {lat, lon} when GPS used
+let lastRoute = null;   // {meters, seconds}
+let map, routeLayer;
+
+// ---------- storage (per-device convenience only) ----------
+function load() {
+  try {
+    // 'mpd' is the pre-rename key; read it once so saved settings survive the upgrade.
+    return JSON.parse(localStorage.getItem('mpd_settings') || localStorage.getItem('mpd') || '{}');
+  } catch { return {}; }
+}
+function save(obj) {
+  try { localStorage.setItem('mpd_settings', JSON.stringify(obj)); localStorage.removeItem('mpd'); } catch {}
+}
+
+// Found addresses are cached so repeat trips work even when every search service is down.
+const GEOCACHE_MAX = 50, GEOCACHE_DAYS = 90;
+function cacheKey(q) { return q.trim().toLowerCase().replace(/\s+/g, ' '); }
+function loadGeocache() {
+  try { return JSON.parse(localStorage.getItem('mpd_geocache') || '{}'); } catch { return {}; }
+}
+function cachedPlace(q) {
+  const hit = loadGeocache()[cacheKey(q)];
+  return hit && Date.now() - hit.t < GEOCACHE_DAYS * 86400000 ? hit : null;
+}
+function cachePlace(q, place) {
+  const c = loadGeocache();
+  c[cacheKey(q)] = { lat: place.lat, lon: place.lon, name: place.name, t: Date.now() };
+  const keys = Object.keys(c).sort((a, b) => c[b].t - c[a].t);
+  keys.slice(GEOCACHE_MAX).forEach(k => delete c[k]);
+  try { localStorage.setItem('mpd_geocache', JSON.stringify(c)); } catch {}
+}
+
+// ---------- helpers ----------
+function todayISO() {
+  const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+  return d.toISOString().slice(0, 10);
+}
+function daysBetween(aISO, bISO) {
+  const a = Date.UTC(...aISO.split('-').map((n, i) => i === 1 ? n - 1 : +n));
+  const b = Date.UTC(...bISO.split('-').map((n, i) => i === 1 ? n - 1 : +n));
+  return Math.round((b - a) / 86400000);
+}
+function fmtDur(sec) {
+  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+function setMsg(text, isErr) {
+  $('msg').textContent = text || '';
+  $('msg').className = 'msg' + (isErr ? ' err' : '');
+}
+
+// ---------- network: timeout, retry, fall back to the next service ----------
+// Tests shrink the timings through window.MPD_TEST.
+const NET = Object.assign({ timeoutMs: 8000, retries: 1, retryDelayMs: 700, rateLimit: true }, window.MPD_TEST);
+
+class NotFound extends Error {}
+class HttpError extends Error {
+  constructor(status, body) { super('HTTP ' + status); this.status = status; this.body = body; }
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function fetchJSON(url) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), NET.timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctl.signal });
+    if (!r.ok) throw new HttpError(r.status, await r.json().catch(() => null));
+    return await r.json();
+  } catch (e) {
+    throw e.name === 'AbortError' ? new Error('timed out') : e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Network errors, timeouts, 429 and 5xx are worth retrying; "not found" and other 4xx are not.
+function isTransient(e) {
+  if (e instanceof NotFound) return false;
+  if (e instanceof HttpError) return e.status === 429 || e.status >= 500;
+  return true;
+}
+
+async function callService(svc, fn) {
+  for (let attempt = 0; ; attempt++) {
+    if (svc.minGapMs && NET.rateLimit) {  // usage policy, e.g. Nominatim allows 1 request per second
+      const wait = (svc.last || 0) + svc.minGapMs - Date.now();
+      if (wait > 0) await sleep(wait);
+      svc.last = Date.now();
+    }
+    try { return await fn(); }
+    catch (e) {
+      if (!isTransient(e) || attempt >= NET.retries) throw e;
+      await sleep(NET.retryDelayMs * 2 ** attempt);
+    }
+  }
+}
+
+// Tries each service in order and returns the first answer, tagged with the service name.
+// Throws NotFound only if every service answered "not found".
+async function firstAnswer(services, fn) {
+  let notFound = 0;
+  for (const svc of services) {
+    try { return { ...(await callService(svc, () => fn(svc))), via: svc.name }; }
+    catch (e) {
+      if (e instanceof NotFound) notFound++;
+      else console.warn(`${svc.name} failed:`, e.message);
+    }
+  }
+  if (notFound === services.length) throw new NotFound();
+  throw new Error(notFound ? 'partial' : 'down');
+}
+
+// ---------- address search ----------
+const lang = encodeURIComponent((navigator.language || 'en').split('-')[0]);
+const GEOCODERS = [
+  { name: 'Nominatim', minGapMs: 1100, async find(q) {
+    const j = await fetchJSON('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1'
+      + '&accept-language=' + lang + '&q=' + encodeURIComponent(q));
+    if (!j.length) throw new NotFound();
+    return { lat: +j[0].lat, lon: +j[0].lon, name: j[0].display_name };
+  } },
+  { name: 'Photon', async find(q) {
+    const j = await fetchJSON('https://photon.komoot.io/api/?limit=1&q=' + encodeURIComponent(q));
+    const f = j.features?.[0];
+    if (!f) throw new NotFound();
+    const p = f.properties, street = [p.housenumber, p.street].filter(Boolean).join(' ');
+    const parts = [p.name || street, p.city, p.state, p.country].filter(Boolean);
+    return { lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0], name: [...new Set(parts)].join(', ') };
+  } },
+  { name: 'Open-Meteo', async find(q) {  // matches place names only, no street addresses
+    const town = q.split(',')[0].trim();
+    const bare = town.replace(/(\s+([A-Za-z]{2,3}|\d{3,}))+$/, '');  // "Darwin NT 0800" -> "Darwin"
+    for (const name of new Set([town, bare])) {
+      const j = await fetchJSON('https://geocoding-api.open-meteo.com/v1/search?count=1&language=' + lang
+        + '&name=' + encodeURIComponent(name));
+      const r = j.results?.[0];
+      if (r) return { lat: r.latitude, lon: r.longitude, name: [r.name, r.admin1, r.country].filter(Boolean).join(', ') };
+    }
+    throw new NotFound();
+  } },
+];
+
+// "-12.46, 130.84" style input skips the search entirely.
+function parseCoords(q) {
+  const m = q.match(/^\s*(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (!m) return null;
+  const lat = +m[1], lon = +m[2];
+  return Math.abs(lat) <= 90 && Math.abs(lon) <= 180 ? { lat, lon, name: `${lat}, ${lon}` } : null;
+}
+
+async function geocode(q) {
+  const coords = parseCoords(q);
+  if (coords) return { ...coords, via: 'coordinates' };
+  const hit = cachedPlace(q);
+  if (hit) return { ...hit, via: 'saved' };
+  try {
+    const place = await firstAnswer(GEOCODERS, svc => svc.find(q));
+    cachePlace(q, place);
+    return place;
+  } catch (e) {
+    if (e instanceof NotFound) throw new Error(`Couldn't find "${q}". Try adding a state or country.`);
+    if (e.message === 'partial') throw new Error(`Couldn't find "${q}" (some search services are unreachable). Check the spelling or try again shortly.`);
+    throw new Error(offlineHint('Address search is unavailable right now.'));
+  }
+}
+
+// ---------- routing ----------
+async function osrm(base, a, b) {
+  try {
+    const j = await fetchJSON(`${base}/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}?overview=full&geometries=geojson`);
+    const r = j.routes?.[0];
+    if (j.code !== 'Ok' || !r) throw new Error('bad response: ' + j.code);
+    return { meters: r.distance, seconds: r.duration, geometry: r.geometry };
+  } catch (e) {
+    if (e instanceof HttpError && e.body?.code === 'NoRoute') throw new NotFound();
+    throw e;
+  }
+}
+
+// Valhalla returns its path as a polyline with 6 decimal places; GeoJSON wants [lon, lat].
+function decodePolyline6(str) {
+  const coords = [];
+  let i = 0, lat = 0, lon = 0;
+  while (i < str.length) {
+    for (const axis of [0, 1]) {
+      let shift = 0, result = 0, byte;
+      do { byte = str.charCodeAt(i++) - 63; result |= (byte & 0x1f) << shift; shift += 5; } while (byte >= 0x20);
+      const delta = result & 1 ? ~(result >> 1) : result >> 1;
+      if (axis === 0) lat += delta; else lon += delta;
+    }
+    coords.push([lon / 1e6, lat / 1e6]);
+  }
+  return coords;
+}
+
+async function valhalla(base, a, b) {
+  const req = { locations: [{ lat: a.lat, lon: a.lon }, { lat: b.lat, lon: b.lon }], costing: 'auto', units: 'kilometers' };
+  try {
+    const j = await fetchJSON(`${base}/route?json=` + encodeURIComponent(JSON.stringify(req)));
+    const s = j.trip?.summary;
+    if (!s) throw new Error('bad response');
+    return { meters: s.length * 1000, seconds: s.time,
+      geometry: { type: 'LineString', coordinates: j.trip.legs.flatMap(l => decodePolyline6(l.shape)) } };
+  } catch (e) {
+    // 442: no path found, 171: no road near a location. (154 = over this server's 1500 km limit, not "no route".)
+    if (e instanceof HttpError && [171, 442].includes(e.body?.error_code)) throw new NotFound();
+    throw e;
+  }
+}
+
+const ROUTERS = [
+  { name: 'OSRM', go: (a, b) => osrm('https://router.project-osrm.org', a, b) },
+  { name: 'OSRM (FOSSGIS)', go: (a, b) => osrm('https://routing.openstreetmap.de/routed-car', a, b) },
+  { name: 'Valhalla (FOSSGIS)', go: (a, b) => valhalla('https://valhalla1.openstreetmap.de', a, b) },
+];
+
+async function route(a, b) {
+  try {
+    return await firstAnswer(ROUTERS, svc => svc.go(a, b));
+  } catch (e) {
+    // 'partial': a router said "no route" and the rest failed; trust the answer we got.
+    if (e instanceof NotFound || e.message === 'partial') throw new Error('No driving route found between those places.');
+    throw new Error(offlineHint('Routing services are busy or unreachable. Try again in a moment.'));
+  }
+}
+
+function offlineHint(msg) {
+  return navigator.onLine === false ? 'You appear to be offline. ' + msg : msg;
+}
+
+// ---------- rendering ----------
+function render() {
+  if (!lastRoute) return;
+  const target = $('date').value;
+  const rest = Math.max(0, parseInt($('rest').value || '0', 10));
+  const diff = daysBetween(todayISO(), target);
+  let driveDays = diff + ($('today').checked ? 1 : 0) - rest;
+
+  const factor = units === 'mi' ? 1 / (1000 * KM_PER_MI) : 1 / 1000;
+  const total = lastRoute.meters * factor;
+
+  $('total').textContent = Math.round(total).toLocaleString() + ' ' + units;
+  $('time').textContent = fmtDur(lastRoute.seconds);
+  $('perDayUnit').textContent = units + ' / day';
+
+  if (diff < 0) {
+    $('perDay').textContent = '–'; $('days').textContent = '–'; $('hrsDay').textContent = '–';
+    setMsg('That date has already passed.', true); return;
+  }
+  if (driveDays < 1) {
+    $('perDay').textContent = '–'; $('days').textContent = '0'; $('hrsDay').textContent = '–';
+    setMsg('No driving days left with those settings. Untick rest days or start today.', true); return;
+  }
+  setMsg('');
+  $('perDay').textContent = Math.ceil(total / driveDays).toLocaleString();
+  $('days').textContent = driveDays;
+  $('hrsDay').textContent = fmtDur(lastRoute.seconds / driveDays);
+}
+
+function drawMap(geojson, a, b) {
+  if (!window.L) return;
+  if (!map) {
+    map = L.map('map', { zoomControl: true, attributionControl: false });
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(map);
+  }
+  if (routeLayer) routeLayer.remove();
+  routeLayer = L.layerGroup([
+    L.geoJSON(geojson, { style: { color: '#0f766e', weight: 5 } }),
+    L.circleMarker([a.lat, a.lon], { radius: 7, color: '#0f766e', fillOpacity: 1 }),
+    L.circleMarker([b.lat, b.lon], { radius: 7, color: '#b42318', fillOpacity: 1 })
+  ]).addTo(map);
+  setTimeout(() => { map.invalidateSize(); map.fitBounds(L.geoJSON(geojson).getBounds(), { padding: [20, 20] }); }, 50);
+}
+
+// ---------- events ----------
+$('gps').addEventListener('click', () => {
+  if (!navigator.geolocation) return setMsg('GPS not available in this browser.', true);
+  setMsg('Getting your location…');
+  navigator.geolocation.getCurrentPosition(p => {
+    gpsCoords = { lat: p.coords.latitude, lon: p.coords.longitude };
+    $('start').value = 'My location';
+    setMsg('Location found.');
+  }, e => setMsg('Location blocked or unavailable. Type a start address instead.', true),
+  { enableHighAccuracy: false, timeout: 15000, maximumAge: 300000 });
+});
+$('start').addEventListener('input', () => { gpsCoords = null; });
+
+document.querySelectorAll('.units button').forEach(btn => btn.addEventListener('click', () => {
+  units = btn.dataset.u;
+  document.querySelectorAll('.units button').forEach(b => b.classList.toggle('on', b === btn));
+  persist(); render();
+}));
+['today', 'rest', 'date'].forEach(id => $(id).addEventListener('change', () => { persist(); render(); }));
+
+function persist() {
+  save({ start: gpsCoords ? '' : $('start').value, dest: $('dest').value, date: $('date').value,
+    today: $('today').checked, rest: $('rest').value, units });
+}
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const startQ = $('start').value.trim(), destQ = $('dest').value.trim();
+  if (!gpsCoords && !startQ) return setMsg('Enter a start address or tap 📍.', true);
+  $('go').disabled = true;
+  try {
+    setMsg('Finding start…');
+    const a = gpsCoords ? { ...gpsCoords, name: 'My location', via: 'GPS' } : await geocode(startQ);
+    setMsg('Finding destination…');
+    const b = await geocode(destQ);
+    setMsg('Finding route…');
+    const r = await route(a, b);
+    lastRoute = { meters: r.meters, seconds: r.seconds };
+    $('result').classList.remove('hidden');
+    $('routeNote').textContent = `From: ${a.name}\nTo: ${b.name}\n`
+      + `Search: ${[...new Set([a.via, b.via])].join(', ')} · Route: ${r.via}`;
+    render();
+    drawMap(r.geometry, a, b);
+    persist();
+  } catch (err) {
+    setMsg(err.message || 'Something went wrong.', true);
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+// ---------- init ----------
+(function init() {
+  const t = todayISO();
+  $('date').min = t;
+  const s = load();
+  if (s.start) $('start').value = s.start;
+  if (s.dest) $('dest').value = s.dest;
+  $('date').value = s.date && s.date >= t ? s.date : '';
+  if (typeof s.today === 'boolean') $('today').checked = s.today;
+  if (s.rest) $('rest').value = s.rest;
+  if (s.units) document.querySelector(`.units button[data-u="${s.units}"]`)?.click();
+})();
+</script>
+</body>
+</html>
