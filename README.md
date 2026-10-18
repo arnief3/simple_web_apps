@@ -8,7 +8,7 @@ Each app is one folder with a self-contained `index.html`; the root `index.html`
 | App | Type | Description |
 | --- | --- | --- |
 | [quick-draw-duel](quick-draw-duel/) | Game | Western reaction duel, 2 players on one screen or vs computer |
-| [miles-per-day](miles-per-day/) | Utility | Fastest driving route, split into daily distances |
+| [miles-per-day](miles-per-day/) | Utility | Fastest driving route (with optional stops), split into daily distances |
 
 ## Running the apps
 

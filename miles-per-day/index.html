@@ -29,7 +29,7 @@
   header p { margin: 4px 0 0; color: var(--muted); font-size: .9rem; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
     padding: 14px; margin-top: 12px; }
-  label { display: block; font-size: .85rem; color: var(--muted); margin: 10px 0 4px; }
+  label, .label { display: block; font-size: .85rem; color: var(--muted); margin: 10px 0 4px; }
   label:first-child { margin-top: 0; }
   input[type=text], input[type=date], input[type=number] {
     width: 100%; padding: 12px; font-size: 16px; border-radius: 10px;
@@ -40,6 +40,12 @@
   .primary { width: 100%; margin-top: 14px; background: var(--accent); color: var(--accent-ink);
     font-weight: 600; font-size: 1.05rem; }
   .ghost { background: transparent; border: 1px solid var(--line); color: var(--text); flex: 0 0 auto; }
+  .ghost:disabled { opacity: .35; cursor: default; }
+  .stops { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  .stops li { display: flex; gap: 6px; }
+  .stops input { flex: 1; min-width: 0; }
+  .icon-btn { flex: 0 0 44px; padding: 0; min-height: 44px; }
+  .add { display: block; width: 100%; margin-top: 8px; color: var(--accent); font-weight: 600; }
   .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: .95rem; min-height: 44px; }
   .check input { width: 20px; height: 20px; }
   .units { display: flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: 12px; }
@@ -55,6 +61,10 @@
   .msg { margin-top: 10px; font-size: .9rem; color: var(--muted); }
   .msg.err { color: var(--bad); }
   #routeNote { white-space: pre-line; overflow-wrap: anywhere; }
+  #legs { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 6px; font-size: .9rem; }
+  #legs li { display: flex; justify-content: space-between; gap: 8px; background: var(--bg);
+    border-radius: 10px; padding: 8px 10px; overflow-wrap: anywhere; }
+  #legs span { color: var(--muted); white-space: nowrap; }
   .hidden { display: none; }
   footer { margin-top: 18px; font-size: .75rem; color: var(--muted); text-align: center; }
   footer a { color: inherit; }
@@ -72,6 +82,10 @@
     <input id="start" type="text" placeholder="Address, town, or use GPS">
     <button type="button" class="ghost" id="gps" aria-label="Use my location">📍</button>
   </div>
+
+  <div class="label" id="stopsLabel">Stops along the way (optional)</div>
+  <ol id="stops" class="stops" aria-labelledby="stopsLabel"></ol>
+  <button type="button" class="ghost add" id="addStop">+ Add stop</button>
 
   <label for="dest">Destination</label>
   <input id="dest" type="text" placeholder="e.g. Darwin NT" required>
@@ -101,6 +115,7 @@
     <div class="stat"><b id="days">–</b><span>Driving days</span></div>
     <div class="stat"><b id="hrsDay">–</b><span>Driving hours / day</span></div>
   </div>
+  <ol id="legs"></ol>
   <div id="routeNote" class="msg"></div>
   <div id="map"></div>
 </section>
@@ -121,7 +136,7 @@ const $ = id => document.getElementById(id);
 const KM_PER_MI = 1.609344;
 let units = 'mi';
 let gpsCoords = null;   // {lat, lon} when GPS used
-let lastRoute = null;   // {meters, seconds}
+let lastRoute = null;   // {meters, seconds, legs: [{meters, seconds}], names: [start, ...stops, dest]}
 let map, routeLayer;
 
 // ---------- storage (per-device convenience only) ----------
@@ -288,12 +303,14 @@ async function geocode(q) {
 }
 
 // ---------- routing ----------
-async function osrm(base, a, b) {
+async function osrm(base, points) {
   try {
-    const j = await fetchJSON(`${base}/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}?overview=full&geometries=geojson`);
+    const coords = points.map(p => `${p.lon},${p.lat}`).join(';');
+    const j = await fetchJSON(`${base}/route/v1/driving/${coords}?overview=full&geometries=geojson`);
     const r = j.routes?.[0];
     if (j.code !== 'Ok' || !r) throw new Error('bad response: ' + j.code);
-    return { meters: r.distance, seconds: r.duration, geometry: r.geometry };
+    return { meters: r.distance, seconds: r.duration, geometry: r.geometry,
+      legs: r.legs.map(l => ({ meters: l.distance, seconds: l.duration })) };
   } catch (e) {
     if (e instanceof HttpError && e.body?.code === 'NoRoute') throw new NotFound();
     throw e;
@@ -316,14 +333,15 @@ function decodePolyline6(str) {
   return coords;
 }
 
-async function valhalla(base, a, b) {
-  const req = { locations: [{ lat: a.lat, lon: a.lon }, { lat: b.lat, lon: b.lon }], costing: 'auto', units: 'kilometers' };
+async function valhalla(base, points) {
+  const req = { locations: points.map(p => ({ lat: p.lat, lon: p.lon })), costing: 'auto', units: 'kilometers' };
   try {
     const j = await fetchJSON(`${base}/route?json=` + encodeURIComponent(JSON.stringify(req)));
     const s = j.trip?.summary;
     if (!s) throw new Error('bad response');
     return { meters: s.length * 1000, seconds: s.time,
-      geometry: { type: 'LineString', coordinates: j.trip.legs.flatMap(l => decodePolyline6(l.shape)) } };
+      geometry: { type: 'LineString', coordinates: j.trip.legs.flatMap(l => decodePolyline6(l.shape)) },
+      legs: j.trip.legs.map(l => ({ meters: l.summary.length * 1000, seconds: l.summary.time })) };
   } catch (e) {
     // 442: no path found, 171: no road near a location. (154 = over this server's 1500 km limit, not "no route".)
     if (e instanceof HttpError && [171, 442].includes(e.body?.error_code)) throw new NotFound();
@@ -332,14 +350,15 @@ async function valhalla(base, a, b) {
 }
 
 const ROUTERS = [
-  { name: 'OSRM', go: (a, b) => osrm('https://router.project-osrm.org', a, b) },
-  { name: 'OSRM (FOSSGIS)', go: (a, b) => osrm('https://routing.openstreetmap.de/routed-car', a, b) },
-  { name: 'Valhalla (FOSSGIS)', go: (a, b) => valhalla('https://valhalla1.openstreetmap.de', a, b) },
+  { name: 'OSRM', go: pts => osrm('https://router.project-osrm.org', pts) },
+  { name: 'OSRM (FOSSGIS)', go: pts => osrm('https://routing.openstreetmap.de/routed-car', pts) },
+  { name: 'Valhalla (FOSSGIS)', go: pts => valhalla('https://valhalla1.openstreetmap.de', pts) },
 ];
 
-async function route(a, b) {
+// points: start, any stops, destination, in driving order.
+async function route(points) {
   try {
-    return await firstAnswer(ROUTERS, svc => svc.go(a, b));
+    return await firstAnswer(ROUTERS, svc => svc.go(points));
   } catch (e) {
     // 'partial': a router said "no route" and the rest failed; trust the answer we got.
     if (e instanceof NotFound || e.message === 'partial') throw new Error('No driving route found between those places.');
@@ -352,6 +371,21 @@ function offlineHint(msg) {
 }
 
 // ---------- rendering ----------
+function toUnits(meters) { return units === 'mi' ? meters / (1000 * KM_PER_MI) : meters / 1000; }
+function fmtDist(meters) { return Math.round(toUnits(meters)).toLocaleString() + ' ' + units; }
+function shortName(p) { return p.via === 'coordinates' ? p.name : p.name.split(',')[0]; }
+
+function renderLegs() {
+  const { legs, names } = lastRoute;
+  $('legs').replaceChildren(...(legs.length > 1 ? legs : []).map((leg, i) => {
+    const li = document.createElement('li'), info = document.createElement('span');
+    li.textContent = `${names[i]} → ${names[i + 1]}`;
+    info.textContent = `${fmtDist(leg.meters)} · ${fmtDur(leg.seconds)}`;
+    li.append(info);
+    return li;
+  }));
+}
+
 function render() {
   if (!lastRoute) return;
   const target = $('date').value;
@@ -359,12 +393,12 @@ function render() {
   const diff = daysBetween(todayISO(), target);
   let driveDays = diff + ($('today').checked ? 1 : 0) - rest;
 
-  const factor = units === 'mi' ? 1 / (1000 * KM_PER_MI) : 1 / 1000;
-  const total = lastRoute.meters * factor;
+  const total = toUnits(lastRoute.meters);
 
-  $('total').textContent = Math.round(total).toLocaleString() + ' ' + units;
+  $('total').textContent = fmtDist(lastRoute.meters);
   $('time').textContent = fmtDur(lastRoute.seconds);
   $('perDayUnit').textContent = units + ' / day';
+  renderLegs();
 
   if (diff < 0) {
     $('perDay').textContent = '–'; $('days').textContent = '–'; $('hrsDay').textContent = '–';
@@ -380,20 +414,57 @@ function render() {
   $('hrsDay').textContent = fmtDur(lastRoute.seconds / driveDays);
 }
 
-function drawMap(geojson, a, b) {
+function drawMap(geojson, points) {
   if (!window.L) return;
   if (!map) {
     map = L.map('map', { zoomControl: true, attributionControl: false });
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(map);
   }
   if (routeLayer) routeLayer.remove();
-  routeLayer = L.layerGroup([
-    L.geoJSON(geojson, { style: { color: '#0f766e', weight: 5 } }),
-    L.circleMarker([a.lat, a.lon], { radius: 7, color: '#0f766e', fillOpacity: 1 }),
-    L.circleMarker([b.lat, b.lon], { radius: 7, color: '#b42318', fillOpacity: 1 })
-  ]).addTo(map);
+  const last = points.length - 1;
+  const markers = points.map((p, i) => {
+    const color = i === 0 ? '#0f766e' : i === last ? '#b42318' : '#d97706';
+    return L.circleMarker([p.lat, p.lon], { radius: i === 0 || i === last ? 7 : 6, color, fillOpacity: 1 })
+      .bindTooltip(i === 0 ? 'Start' : i === last ? 'Destination' : `Stop ${i}`);
+  });
+  routeLayer = L.layerGroup([L.geoJSON(geojson, { style: { color: '#0f766e', weight: 5 } }), ...markers]).addTo(map);
   setTimeout(() => { map.invalidateSize(); map.fitBounds(L.geoJSON(geojson).getBounds(), { padding: [20, 20] }); }, 50);
 }
+
+// ---------- stops along the way ----------
+const MAX_STOPS = 10;
+function stopInputs() { return [...document.querySelectorAll('#stops input')]; }
+
+function addStop(value = '') {
+  if (stopInputs().length >= MAX_STOPS) return null;
+  const li = document.createElement('li');
+  li.innerHTML = `<input type="text">
+    <button type="button" class="ghost icon-btn up" aria-label="Move stop up">↑</button>
+    <button type="button" class="ghost icon-btn del" aria-label="Remove stop">✕</button>`;
+  li.querySelector('input').value = value;
+  $('stops').append(li);
+  updateStops();
+  return li.querySelector('input');
+}
+
+function updateStops() {
+  stopInputs().forEach((inp, i) => {
+    inp.placeholder = `Stop ${i + 1}`;
+    inp.setAttribute('aria-label', `Stop ${i + 1}`);
+  });
+  document.querySelectorAll('#stops .up').forEach((b, i) => { b.disabled = i === 0; });
+  $('addStop').disabled = stopInputs().length >= MAX_STOPS;
+}
+
+$('addStop').addEventListener('click', () => { addStop()?.focus(); persist(); });
+$('stops').addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const li = btn.closest('li');
+  if (btn.classList.contains('del')) li.remove();
+  else if (li.previousElementSibling) li.previousElementSibling.before(li);
+  updateStops(); persist();
+});
 
 // ---------- events ----------
 $('gps').addEventListener('click', () => {
@@ -403,6 +474,7 @@ $('gps').addEventListener('click', () => {
     gpsCoords = { lat: p.coords.latitude, lon: p.coords.longitude };
     $('start').value = 'My location';
     setMsg('Location found.');
+    persist();
   }, e => setMsg('Location blocked or unavailable. Type a start address instead.', true),
   { enableHighAccuracy: false, timeout: 15000, maximumAge: 300000 });
 });
@@ -413,32 +485,44 @@ document.querySelectorAll('.units button').forEach(btn => btn.addEventListener('
   document.querySelectorAll('.units button').forEach(b => b.classList.toggle('on', b === btn));
   persist(); render();
 }));
-['today', 'rest', 'date'].forEach(id => $(id).addEventListener('change', () => { persist(); render(); }));
+['today', 'rest', 'date'].forEach(id => $(id).addEventListener('change', render));
+// Save every edit, so the form is filled in again when the page is reopened.
+$('form').addEventListener('input', persist);
+$('form').addEventListener('change', persist);
 
 function persist() {
-  save({ start: gpsCoords ? '' : $('start').value, dest: $('dest').value, date: $('date').value,
-    today: $('today').checked, rest: $('rest').value, units });
+  // A GPS start isn't saved: the location may be stale by the next visit.
+  save({ start: gpsCoords ? '' : $('start').value, stops: stopInputs().map(i => i.value),
+    dest: $('dest').value, date: $('date').value, today: $('today').checked, rest: $('rest').value, units });
 }
 
 $('form').addEventListener('submit', async e => {
   e.preventDefault();
   const startQ = $('start').value.trim(), destQ = $('dest').value.trim();
+  const stopQs = stopInputs().map(i => i.value.trim()).filter(Boolean);
   if (!gpsCoords && !startQ) return setMsg('Enter a start address or tap 📍.', true);
   $('go').disabled = true;
   try {
     setMsg('Finding start…');
-    const a = gpsCoords ? { ...gpsCoords, name: 'My location', via: 'GPS' } : await geocode(startQ);
+    const points = [gpsCoords ? { ...gpsCoords, name: 'My location', via: 'GPS' } : await geocode(startQ)];
+    for (const [i, q] of stopQs.entries()) {
+      setMsg(`Finding stop ${i + 1} of ${stopQs.length}…`);
+      points.push(await geocode(q));
+    }
     setMsg('Finding destination…');
-    const b = await geocode(destQ);
+    points.push(await geocode(destQ));
     setMsg('Finding route…');
-    const r = await route(a, b);
-    lastRoute = { meters: r.meters, seconds: r.seconds };
+    const r = await route(points);
+    const names = points.map(shortName);
+    lastRoute = { meters: r.meters, seconds: r.seconds, legs: r.legs, names };
     $('result').classList.remove('hidden');
-    $('routeNote').textContent = `From: ${a.name}\nTo: ${b.name}\n`
-      + `Search: ${[...new Set([a.via, b.via])].join(', ')} · Route: ${r.via}`;
+    const via = names.slice(1, -1);
+    $('routeNote').textContent = `From: ${points[0].name}\n`
+      + (via.length ? `Via: ${via.join(' · ')}\n` : '')
+      + `To: ${points[points.length - 1].name}\n`
+      + `Search: ${[...new Set(points.map(p => p.via))].join(', ')} · Route: ${r.via}`;
     render();
-    drawMap(r.geometry, a, b);
-    persist();
+    drawMap(r.geometry, points);
   } catch (err) {
     setMsg(err.message || 'Something went wrong.', true);
   } finally {
@@ -452,11 +536,13 @@ $('form').addEventListener('submit', async e => {
   $('date').min = t;
   const s = load();
   if (s.start) $('start').value = s.start;
+  (Array.isArray(s.stops) ? s.stops : []).forEach(v => addStop(String(v)));
   if (s.dest) $('dest').value = s.dest;
   $('date').value = s.date && s.date >= t ? s.date : '';
   if (typeof s.today === 'boolean') $('today').checked = s.today;
   if (s.rest) $('rest').value = s.rest;
   if (s.units) document.querySelector(`.units button[data-u="${s.units}"]`)?.click();
+  updateStops();
 })();
 </script>
 </body>
