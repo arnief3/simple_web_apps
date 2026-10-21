@@ -154,7 +154,8 @@ class FakeServices:
 def svc(page: Page, base_url: str) -> FakeServices:
     fake = FakeServices(page)
     page.add_init_script(
-        "window.MPD_TEST = {timeoutMs: 400, retries: 1, retryDelayMs: 10, rateLimit: false}"
+        "window.MPD_TEST = {timeoutMs: 400, hedgeMs: 2000, cooldownMs: 60000, retries: 1,"
+        " retryDelayMs: 10, rateLimit: false}"
     )
     page.goto(f"{base_url}/miles-per-day/")
     return fake
@@ -217,7 +218,7 @@ def test_search_retries_then_falls_back_to_photon(page: Page, svc: FakeServices)
     plan(page)
     expect_result(page, "200")
     expect(page.locator("#routeNote")).to_contain_text("Search: Photon")
-    assert svc.calls["nominatim"] == 4  # 1 try + 1 retry, for start and destination
+    assert svc.calls["nominatim"] == 2  # 1 try + 1 retry for start; skipped for destination
     assert svc.calls["photon"] == 2
 
 
@@ -226,6 +227,45 @@ def test_search_timeout_falls_back(page: Page, svc: FakeServices) -> None:
     plan(page)
     expect_result(page, "200")
     expect(page.locator("#routeNote")).to_contain_text("Search: Photon")
+    assert svc.calls["nominatim"] == 1  # a timeout is not retried, then the server cools down
+
+
+def test_slow_service_gets_company_from_the_next(page: Page, svc: FakeServices) -> None:
+    page.evaluate("Object.assign(NET, {timeoutMs: 30000, hedgeMs: 100})")
+    svc.mode["nominatim"] = svc.mode["osrm"] = "hang"
+    plan(page)
+    expect_result(page, "200")  # well before the 30 s timeout
+    expect(page.locator("#routeNote")).to_contain_text("Search: Photon · Route: OSRM (FOSSGIS)")
+
+
+def test_failed_service_is_tried_again_after_cooldown(page: Page, svc: FakeServices) -> None:
+    page.evaluate("NET.cooldownMs = 300")
+    svc.mode["nominatim"] = 503
+    plan(page)
+    expect(page.locator("#routeNote")).to_contain_text("Search: Photon")
+    svc.mode["nominatim"] = "ok"
+    page.evaluate("localStorage.removeItem('mpd_geocache')")
+    page.wait_for_timeout(400)
+    page.click("#go")
+    expect(page.locator("#routeNote")).to_contain_text("Search: Nominatim")
+
+
+def test_all_services_cooling_down_are_tried_anyway(page: Page, svc: FakeServices) -> None:
+    for s in ("osrm", "osrm_fossgis", "valhalla"):
+        svc.mode[s] = 503
+    plan(page)
+    expect(page.locator("#msg")).to_contain_text("Routing services are busy")
+    for s in ("osrm", "osrm_fossgis", "valhalla"):
+        svc.mode[s] = "ok"
+    page.click("#go")
+    expect_result(page, "200")
+    expect(page.locator("#routeNote")).to_contain_text("Route: OSRM")
+
+
+def test_osrm_asks_for_simplified_geometry(page: Page, svc: FakeServices) -> None:
+    plan(page)
+    expect_result(page, "200")
+    assert "overview=simplified" in svc.urls["osrm"][-1]
 
 
 def test_search_falls_back_to_open_meteo(page: Page, svc: FakeServices) -> None:
@@ -417,3 +457,77 @@ def test_old_saved_settings_still_load(page: Page, base_url: str) -> None:
     expect(page.locator("#stops input")).to_have_count(0)
     expect(page.locator('.units button[data-u="km"]')).to_have_class("on")
     assert page.js_errors == []
+
+
+# ---------- saved route ----------
+
+ROUTERS = ("osrm", "osrm_fossgis", "valhalla")
+
+
+def routers_down(svc: FakeServices) -> None:
+    for s in ROUTERS:
+        svc.mode[s] = 503
+
+
+def router_calls(svc: FakeServices) -> int:
+    return sum(svc.calls[s] for s in ROUTERS)
+
+
+def test_same_trip_reuses_saved_route(page: Page, svc: FakeServices) -> None:
+    plan(page)
+    expect_result(page, "200")
+    assert router_calls(svc) == 1
+    page.reload()  # saved across visits
+    page.click("#go")
+    expect(page.locator("#routeNote")).to_contain_text("Route: saved")
+    expect(page.locator("#total")).to_have_text("1,000 mi")
+    assert router_calls(svc) == 1
+
+
+def test_estimate_from_saved_route_when_routers_down(page: Page, svc: FakeServices) -> None:
+    plan(page, days_ahead=2)  # Darwin -> Alice Springs, 1000 mi, 3 driving days
+    expect_result(page, "334")
+    routers_down(svc)
+    page.fill("#start", "-18.08, 132.36")  # halfway along the (straight, fake) road
+    page.click("#go")
+    expect(page.locator("#routeNote")).to_contain_text("Route: estimate from saved route")
+    expect(page.locator("#routeNote")).to_contain_text("estimated from your last route")
+    expect_result(page, "167")
+    expect(page.locator("#total")).to_have_text("500 mi")
+    expect(page.locator("#time")).to_have_text("5h 0m")
+
+
+def test_estimate_skips_stops_already_passed(page: Page, svc: FakeServices) -> None:
+    plan(page, days_ahead=2, stops=("Katherine NT", "Tennant Creek NT"))  # 3 legs of 333 mi
+    expect_result(page, "334")
+    routers_down(svc)
+    page.fill("#start", "-17.06, 133.225")  # halfway from Katherine to Tennant Creek
+    page.click("#go")
+    expect(page.locator("#routeNote")).to_contain_text("Skipped 1 stop already passed.")
+    expect(page.locator("#total")).to_have_text("500 mi")
+    legs = page.locator("#legs li")
+    expect(legs).to_have_count(2)
+    expect(legs.nth(0)).to_contain_text("-17.06, 133.225 → Tennant Creek")
+    expect(legs.nth(0)).to_contain_text("167 mi")
+    expect(legs.nth(1)).to_contain_text("Tennant Creek → Alice Springs")
+    expect(legs.nth(1)).to_contain_text("333 mi")
+    expect(page.locator("#routeNote")).to_contain_text("Via: Tennant Creek\n")
+
+
+def test_no_estimate_when_start_is_off_the_route(page: Page, svc: FakeServices) -> None:
+    plan(page)
+    expect_result(page, "200")
+    routers_down(svc)
+    page.fill("#start", "-18.08, 133.00")  # ~65 km east of the road
+    page.click("#go")
+    expect(page.locator("#msg")).to_contain_text("Routing services are busy")
+
+
+def test_no_estimate_for_a_different_destination(page: Page, svc: FakeServices) -> None:
+    plan(page, dest="Tennant Creek NT", start="Darwin NT")
+    expect_result(page, "200")
+    routers_down(svc)
+    page.fill("#start", "-14.47, 132.26")
+    page.fill("#dest", "Alice Springs NT")
+    page.click("#go")
+    expect(page.locator("#msg")).to_contain_text("Routing services are busy")

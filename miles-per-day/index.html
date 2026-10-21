@@ -188,10 +188,13 @@ function setMsg(text, isErr) {
 }
 
 // ---------- network: timeout, retry, fall back to the next service ----------
-// Tests shrink the timings through window.MPD_TEST.
-const NET = Object.assign({ timeoutMs: 8000, retries: 1, retryDelayMs: 700, rateLimit: true }, window.MPD_TEST);
+// The free servers get slow when busy, so a slow service gets company from the next one after
+// hedgeMs, and a failed one is skipped for cooldownMs. Tests shrink the timings through window.MPD_TEST.
+const NET = Object.assign({ timeoutMs: 12000, hedgeMs: 3000, cooldownMs: 120000, retries: 1,
+  retryDelayMs: 700, rateLimit: true }, window.MPD_TEST);
 
 class NotFound extends Error {}
+class Timeout extends Error {}
 class HttpError extends Error {
   constructor(status, body) { super('HTTP ' + status); this.status = status; this.body = body; }
 }
@@ -205,15 +208,16 @@ async function fetchJSON(url) {
     if (!r.ok) throw new HttpError(r.status, await r.json().catch(() => null));
     return await r.json();
   } catch (e) {
-    throw e.name === 'AbortError' ? new Error('timed out') : e;
+    throw e.name === 'AbortError' ? new Timeout('timed out') : e;
   } finally {
     clearTimeout(timer);
   }
 }
 
-// Network errors, timeouts, 429 and 5xx are worth retrying; "not found" and other 4xx are not.
+// Network errors, 429 and 5xx are worth retrying; "not found", other 4xx and timeouts are not
+// (a server that just took timeoutMs to fail is too busy to ask again).
 function isTransient(e) {
-  if (e instanceof NotFound) return false;
+  if (e instanceof NotFound || e instanceof Timeout) return false;
   if (e instanceof HttpError) return e.status === 429 || e.status >= 500;
   return true;
 }
@@ -233,19 +237,41 @@ async function callService(svc, fn) {
   }
 }
 
-// Tries each service in order and returns the first answer, tagged with the service name.
+// Asks the services in order and returns the first answer, tagged with the service name.
+// The next service starts when one fails or has not answered within hedgeMs. Services that failed
+// in the last cooldownMs are skipped, unless all of them did.
 // Throws NotFound only if every service answered "not found".
-async function firstAnswer(services, fn) {
-  let notFound = 0;
-  for (const svc of services) {
-    try { return { ...(await callService(svc, () => fn(svc))), via: svc.name }; }
-    catch (e) {
-      if (e instanceof NotFound) notFound++;
-      else console.warn(`${svc.name} failed:`, e.message);
-    }
-  }
-  if (notFound === services.length) throw new NotFound();
-  throw new Error(notFound ? 'partial' : 'down');
+function firstAnswer(services, fn) {
+  const now = Date.now();
+  let queue = services.filter(s => !(s.downUntil > now));
+  if (!queue.length) queue = [...services];
+  let notFound = 0, running = 0, done = false, hedge;
+  return new Promise((resolve, reject) => {
+    const next = () => {
+      clearTimeout(hedge);
+      const svc = queue.shift();
+      running++;
+      hedge = setTimeout(() => queue.length && next(), NET.hedgeMs);
+      callService(svc, () => fn(svc)).then(r => {
+        running--;
+        svc.downUntil = 0;
+        if (done) return;
+        done = true;
+        clearTimeout(hedge);
+        resolve({ ...r, via: svc.name });
+      }, e => {
+        running--;
+        if (e instanceof NotFound) notFound++;
+        else { svc.downUntil = Date.now() + NET.cooldownMs; console.warn(`${svc.name} failed:`, e.message); }
+        if (done) return;
+        if (queue.length) return next();
+        if (running) return;  // a slower service may still answer
+        done = true;
+        reject(notFound === services.length ? new NotFound() : new Error(notFound ? 'partial' : 'down'));
+      });
+    };
+    next();
+  });
 }
 
 // ---------- address search ----------
@@ -306,7 +332,7 @@ async function geocode(q) {
 async function osrm(base, points) {
   try {
     const coords = points.map(p => `${p.lon},${p.lat}`).join(';');
-    const j = await fetchJSON(`${base}/route/v1/driving/${coords}?overview=full&geometries=geojson`);
+    const j = await fetchJSON(`${base}/route/v1/driving/${coords}?overview=simplified&geometries=geojson`);
     const r = j.routes?.[0];
     if (j.code !== 'Ok' || !r) throw new Error('bad response: ' + j.code);
     return { meters: r.distance, seconds: r.duration, geometry: r.geometry,
@@ -356,14 +382,109 @@ const ROUTERS = [
 ];
 
 // points: start, any stops, destination, in driving order.
+// Same trip as last time: the saved route, no router needed. Routers down: an estimate from the
+// saved route if the start is on it. Result: {meters, seconds, legs, geometry, via, skipped, estimated}.
 async function route(points) {
+  const saved = savedRoute(points);
+  if (saved && distM(points[0], crumbPlace(saved.points[0])) < SAME_START_M) {
+    return { meters: saved.meters, seconds: saved.seconds, legs: saved.legs,
+      geometry: { type: 'LineString', coordinates: saved.crumbs.map(([lat, lon]) => [lon, lat]) },
+      via: 'saved', skipped: 0 };
+  }
   try {
-    return await firstAnswer(ROUTERS, svc => svc.go(points));
+    const r = await firstAnswer(ROUTERS, svc => svc.go(points));
+    saveRoute(points, r);
+    return { ...r, skipped: 0 };
   } catch (e) {
     // 'partial': a router said "no route" and the rest failed; trust the answer we got.
     if (e instanceof NotFound || e.message === 'partial') throw new Error('No driving route found between those places.');
+    const est = saved && estimateFrom(saved, points[0]);
+    if (est) return { ...est, via: 'estimate from saved route', estimated: true };
     throw new Error(offlineHint('Routing services are busy or unreachable. Try again in a moment.'));
   }
+}
+
+// ---------- saved route: repeat trips, and estimates while the routers are down ----------
+// The last route is kept as ~CRUMBS breadcrumbs [lat, lon, metres driven to that point]. Each leg of
+// the line is scaled to the router's distance for that leg, so the stops line up with the legs.
+const CRUMBS = 250, SAME_START_M = 100, ON_ROUTE_M = 10000, ROUTE_DAYS = 90;
+
+function distM(a, b) {  // great-circle distance in metres
+  const r = Math.PI / 180, dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371000 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+function crumbPlace([lat, lon]) { return { lat, lon }; }
+
+function saveRoute(points, r) {
+  const line = r.geometry.coordinates.map(([lon, lat]) => ({ lat, lon }));
+  if (line.length < 2) return;
+  let len = 0;
+  const cum = line.map((p, i) => (len += i ? distM(line[i - 1], p) : 0));
+  const driven = [];
+  let from = 0, base = 0;
+  points.slice(1).forEach((stop, k) => {
+    let to = line.length - 1;
+    if (k < points.length - 2) {  // a stop: the nearest line point from here on
+      to = from;
+      for (let i = from; i < line.length; i++) if (distM(line[i], stop) < distM(line[to], stop)) to = i;
+    }
+    const scale = cum[to] > cum[from] ? r.legs[k].meters / (cum[to] - cum[from]) : 0;
+    for (let i = from; i <= to; i++) driven[i] = base + (cum[i] - cum[from]) * scale;
+    base += r.legs[k].meters;
+    from = to;
+  });
+  const crumbs = [];
+  let kept = -Infinity;
+  line.forEach((p, i) => {
+    if (i < line.length - 1 && cum[i] - kept < len / CRUMBS) return;
+    crumbs.push([+p.lat.toFixed(5), +p.lon.toFixed(5), Math.round(driven[i])]);
+    kept = cum[i];
+  });
+  const saved = { points: points.map(p => [p.lat, p.lon]), meters: r.meters, seconds: r.seconds,
+    legs: r.legs, crumbs, t: Date.now() };
+  try { localStorage.setItem('mpd_route', JSON.stringify(saved)); } catch {}
+}
+
+// The saved route, if it has the same stops and destination (the start may differ).
+function savedRoute(points) {
+  let s;
+  try { s = JSON.parse(localStorage.getItem('mpd_route')); } catch { return null; }
+  if (!s?.crumbs || s.points.length !== points.length || Date.now() - s.t > ROUTE_DAYS * 86400000) return null;
+  return points.slice(1).every((p, i) => distM(p, crumbPlace(s.points[i + 1])) < 50) ? s : null;
+}
+
+// Projects the start onto the saved line (closest point of any segment, flat-earth around the
+// start, fine at this scale) and returns what is left of the trip from there, or null if the
+// start is more than ON_ROUTE_M off the line. Stops already passed are skipped.
+function estimateFrom(s, start) {
+  const kx = Math.cos(start.lat * Math.PI / 180) * 111320, ky = 110540;
+  const xy = ([lat, lon]) => [(lon - start.lon) * kx, (lat - start.lat) * ky];
+  let best = { d: Infinity };
+  for (let i = 1; i < s.crumbs.length; i++) {
+    const a = s.crumbs[i - 1], b = s.crumbs[i], [ax, ay] = xy(a), [bx, by] = xy(b);
+    const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    const f = l2 ? Math.min(1, Math.max(0, -(ax * dx + ay * dy) / l2)) : 0;
+    const d = Math.hypot(ax + f * dx, ay + f * dy);
+    if (d < best.d) best = { d, i, f, driven: a[2] + f * (b[2] - a[2]) };
+  }
+  if (best.d > ON_ROUTE_M) return null;
+
+  const legs = [];
+  let end = 0, skipped = 0;
+  s.legs.forEach((leg, k) => {
+    end += leg.meters;
+    if (legs.length) return legs.push(leg);
+    if (best.driven >= end && k < s.legs.length - 1) return skipped++;
+    // The rest of this leg at its average speed, plus the way from the start to the line.
+    const left = Math.max(0, Math.min(leg.meters, end - best.driven)) + best.d;
+    legs.push({ meters: left, seconds: leg.meters ? left * leg.seconds / leg.meters : 0 });
+  });
+  const a = s.crumbs[best.i - 1], b = s.crumbs[best.i];
+  const coordinates = [[start.lon, start.lat], [a[1] + best.f * (b[1] - a[1]), a[0] + best.f * (b[0] - a[0])],
+    ...s.crumbs.slice(best.i).map(([lat, lon]) => [lon, lat])];
+  return { meters: legs.reduce((t, l) => t + l.meters, 0), seconds: legs.reduce((t, l) => t + l.seconds, 0),
+    legs, geometry: { type: 'LineString', coordinates }, skipped };
 }
 
 function offlineHint(msg) {
@@ -513,16 +634,19 @@ $('form').addEventListener('submit', async e => {
     points.push(await geocode(destQ));
     setMsg('Finding route…');
     const r = await route(points);
-    const names = points.map(shortName);
+    const ahead = [points[0], ...points.slice(1 + r.skipped)];  // without stops already passed
+    const names = ahead.map(shortName);
     lastRoute = { meters: r.meters, seconds: r.seconds, legs: r.legs, names };
     $('result').classList.remove('hidden');
     const via = names.slice(1, -1);
     $('routeNote').textContent = `From: ${points[0].name}\n`
       + (via.length ? `Via: ${via.join(' · ')}\n` : '')
       + `To: ${points[points.length - 1].name}\n`
-      + `Search: ${[...new Set(points.map(p => p.via))].join(', ')} · Route: ${r.via}`;
+      + `Search: ${[...new Set(points.map(p => p.via))].join(', ')} · Route: ${r.via}`
+      + (r.estimated ? '\nRouting servers are unreachable, so this is estimated from your last route.' : '')
+      + (r.skipped ? `\nSkipped ${r.skipped} stop${r.skipped > 1 ? 's' : ''} already passed.` : '');
     render();
-    drawMap(r.geometry, points);
+    drawMap(r.geometry, ahead);
   } catch (err) {
     setMsg(err.message || 'Something went wrong.', true);
   } finally {
